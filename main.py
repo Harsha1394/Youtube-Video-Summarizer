@@ -7,121 +7,141 @@ from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.decomposition import LatentDirichletAllocation
 from transformers import pipeline
 from textblob import TextBlob
-import re
 import nltk
+import re
 
-# Ensure that necessary NLTK data is downloaded
-nltk.download('punkt')
-nltk.download('stopwords')
-nltk.download('wordnet')
+# ------------------ NLTK DOWNLOAD (SAFE) ------------------
+@st.cache_resource
+def download_nltk():
+    nltk.download('punkt')
+    nltk.download('stopwords')
+    nltk.download('wordnet')
 
-# Function to summarize text
-def summarize_text(text, max_length=50000):
-    summarization_pipeline = pipeline("summarization")
-    summary = summarization_pipeline(text, max_length=max_length, min_length=50, do_sample=False)
-    return summary[0]['summary_text']
+download_nltk()
 
-# Function to extract keywords
+# ------------------ EXTRACT VIDEO ID ------------------
+def extract_video_id(url):
+    patterns = [
+        r"v=([^&]+)",
+        r"youtu.be/([^?]+)",
+        r"youtube.com/embed/([^?]+)"
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+# ------------------ FETCH TRANSCRIPT ------------------
+def get_transcript(video_id):
+    try:
+        return YouTubeTranscriptApi.get_transcript(video_id)
+    except:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        return transcript_list.find_transcript(['en']).fetch()
+
+# ------------------ SUMMARIZATION (CHUNKED) ------------------
+@st.cache_resource
+def load_summarizer():
+    return pipeline("summarization", model="facebook/bart-large-cnn")
+
+def summarize_text(text):
+    summarizer = load_summarizer()
+    chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
+    summaries = []
+
+    for chunk in chunks[:5]:  # limit for performance
+        s = summarizer(chunk, max_length=150, min_length=50, do_sample=False)
+        summaries.append(s[0]['summary_text'])
+
+    return " ".join(summaries)
+
+# ------------------ KEYWORD EXTRACTION ------------------
 def extract_keywords(text):
     stop_words = set(stopwords.words('english'))
     lemmatizer = WordNetLemmatizer()
 
     words = word_tokenize(text)
-    words = [lemmatizer.lemmatize(word.lower()) for word in words if word.isalnum()]
-    keywords = [word for word in words if word not in stop_words and len(word) > 1]
+    words = [
+        lemmatizer.lemmatize(word.lower())
+        for word in words if word.isalnum()
+    ]
 
-    counter = CountVectorizer().fit_transform([' '.join(keywords)])
-    vocabulary = CountVectorizer().fit([' '.join(keywords)]).vocabulary_
-    top_keywords = sorted(vocabulary, key=vocabulary.get, reverse=True)[:5]
+    filtered_words = [w for w in words if w not in stop_words and len(w) > 2]
 
-    return top_keywords
+    vectorizer = CountVectorizer(max_features=10)
+    X = vectorizer.fit_transform([' '.join(filtered_words)])
+    return vectorizer.get_feature_names_out()
 
-# Function to perform topic modeling (LDA)
+# ------------------ TOPIC MODELING ------------------
 def topic_modeling(text):
-    vectorizer = CountVectorizer(max_df=2, min_df=0.95, stop_words='english')
+    vectorizer = CountVectorizer(
+        max_df=0.9,
+        min_df=1,
+        stop_words='english'
+    )
     tf = vectorizer.fit_transform([text])
-    lda_model = LatentDirichletAllocation(n_components=5, max_iter=5, learning_method='online', random_state=42)
-    lda_model.fit(tf)
+
+    lda = LatentDirichletAllocation(
+        n_components=3,
+        random_state=42
+    )
+    lda.fit(tf)
+
     feature_names = vectorizer.get_feature_names_out()
     topics = []
-    for topic_idx, topic in enumerate(lda_model.components_):
+
+    for topic in lda.components_:
         topics.append([feature_names[i] for i in topic.argsort()[:-6:-1]])
+
     return topics
 
-# Function to extract YouTube video ID from URL
-def extract_video_id(url):
-    video_id = None
-    patterns = [
-        r'v=([^&]+)',  # Pattern for URLs with 'v=' parameter
-        r'youtu.be/([^?]+)',  # Pattern for shortened URLs
-        r'youtube.com/embed/([^?]+)'  # Pattern for embed URLs
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            video_id = match.group(1)
-            break
-    return video_id
-
-# Main Streamlit app
+# ------------------ STREAMLIT APP ------------------
 def main():
-    st.title("YouTube Video Summarizer")
+    st.title("🎥 YouTube Video Summarizer")
 
-    # User input for YouTube video URL
-    video_url = st.text_input("Enter YouTube Video URL:", "")
-
-    # User customization options
-    max_summary_length = st.slider("Max Summary Length:", 1000, 20000, 50000)
+    video_url = st.text_input("Enter YouTube Video URL")
 
     if st.button("Summarize"):
         try:
-            # Extract video ID from URL
             video_id = extract_video_id(video_url)
             if not video_id:
-                st.error("Invalid YouTube URL. Please enter a valid URL.")
+                st.error("❌ Invalid YouTube URL")
                 return
 
-            # Get transcript of the video
-            transcript = YouTubeTranscriptApi.get_transcript(video_id)
-            if not transcript:
-                st.error("Transcript not available for this video.")
-                return
+            with st.spinner("Fetching transcript..."):
+                transcript = get_transcript(video_id)
 
-            video_text = ' '.join([line['text'] for line in transcript])
+            text = " ".join([t['text'] for t in transcript])
 
-            # Summarize the transcript
-            summary = summarize_text(video_text, max_length=max_summary_length)
+            with st.spinner("Summarizing video..."):
+                summary = summarize_text(text)
 
-            # Extract keywords from the transcript
-            keywords = extract_keywords(video_text)
+            keywords = extract_keywords(text)
+            topics = topic_modeling(text)
+            sentiment = TextBlob(text).sentiment
 
-            # Perform topic modeling
-            topics = topic_modeling(video_text)
-
-            # Perform sentiment analysis
-            sentiment = TextBlob(video_text).sentiment
-
-            # Display summarized text, keywords, topics, and sentiment
-            st.subheader("Video Summary:")
+            st.subheader("📌 Summary")
             st.write(summary)
 
-            st.subheader("Keywords:")
-            st.write(keywords)
+            st.subheader("🔑 Keywords")
+            st.write(list(keywords))
 
-            st.subheader("Topics:")
-            for idx, topic in enumerate(topics):
-                st.write(f"Topic {idx+1}: {', '.join(topic)}")
+            st.subheader("🧠 Topics")
+            for i, topic in enumerate(topics, 1):
+                st.write(f"Topic {i}: {', '.join(topic)}")
 
-            st.subheader("Sentiment Analysis:")
+            st.subheader("😊 Sentiment Analysis")
             st.write(f"Polarity: {sentiment.polarity}")
             st.write(f"Subjectivity: {sentiment.subjectivity}")
 
         except TranscriptsDisabled:
-            st.error("Transcripts are disabled for this video.")
+            st.error("❌ Transcripts are disabled for this video")
         except NoTranscriptFound:
-            st.error("No transcript found for this video.")
+            st.error("❌ No transcript found")
         except Exception as e:
-            st.error(f"Error: {str(e)}")
+            st.error(f"⚠ Error: {str(e)}")
 
+# ------------------ RUN APP ------------------
 if __name__ == "__main__":
     main()
