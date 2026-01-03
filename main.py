@@ -1,4 +1,6 @@
 import streamlit as st
+import re
+import nltk
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
